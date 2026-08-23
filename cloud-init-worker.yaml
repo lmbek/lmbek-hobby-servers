@@ -1,0 +1,58 @@
+#cloud-config
+# ─────────────────────────────────────────────────────────────────────────────
+# Cloud-init configuration for K3s Worker Node (Workload Pods)
+# ─────────────────────────────────────────────────────────────────────────────
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - curl
+  - wget
+  - git
+  - jq
+  - ufw
+  - fail2ban
+  - ca-certificates
+  - open-iscsi
+  - nfs-common
+  - iptables
+
+write_files:
+  - path: /etc/modules-load.d/k3s.conf
+    permissions: '0644'
+    content: |
+      overlay
+      br_netfilter
+
+  - path: /etc/sysctl.d/99-kubernetes-k3s.conf
+    permissions: '0644'
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+
+runcmd:
+  # Load kernel modules and apply sysctl settings
+  - modprobe overlay
+  - modprobe br_netfilter
+  - sysctl --system
+
+  # Configure UFW firewall
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 22/tcp comment 'SSH'
+  - ufw allow in on eth1 comment 'Hetzner Private Network'
+  - ufw --force enable
+
+  # Wait for Master K3s API to become healthy on private network before joining
+  - >
+    bash -c '
+    echo "Waiting for Master API endpoint at https://${master_private_ip}:6443/ping..."
+    until curl -k -s -f https://${master_private_ip}:6443/ping; do
+      echo "Master API not ready yet. Retrying in 5 seconds..."
+      sleep 5
+    done
+    echo "Master API is ready! Joining cluster as worker node..."
+    curl -sfL https://get.k3s.io | K3S_URL=https://${master_private_ip}:6443 K3S_TOKEN=${cluster_token} INSTALL_K3S_EXEC="agent --node-ip ${worker_private_ip} --flannel-iface eth1" sh -
+    '

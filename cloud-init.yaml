@@ -1,0 +1,61 @@
+#cloud-config
+# ─────────────────────────────────────────────────────────────────────────────
+# Cloud-init configuration for lightweight k3s Single-Node Kubernetes Platform
+# Target OS: Ubuntu 22.04 LTS / 24.04 LTS or Debian 12
+# ─────────────────────────────────────────────────────────────────────────────
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - curl
+  - wget
+  - git
+  - jq
+  - ufw
+  - fail2ban
+  - ca-certificates
+  - gnupg
+  - lsb-release
+  - open-iscsi
+  - nfs-common
+  - iptables
+
+write_files:
+  # Enable required kernel modules for k3s networking
+  - path: /etc/modules-load.d/k3s.conf
+    permissions: '0644'
+    content: |
+      overlay
+      br_netfilter
+
+  # Kernel sysctl parameters required for Kubernetes bridge networking & forwarding
+  - path: /etc/sysctl.d/99-kubernetes-k3s.conf
+    permissions: '0644'
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+
+runcmd:
+  # Load kernel modules and apply sysctl settings
+  - modprobe overlay
+  - modprobe br_netfilter
+  - sysctl --system
+
+  # Configure UFW firewall
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 22/tcp comment 'SSH'
+  - ufw allow 80/tcp comment 'HTTP (Traefik Ingress)'
+  - ufw allow 443/tcp comment 'HTTPS (Traefik Ingress)'
+  - ufw allow 6443/tcp comment 'Kubernetes API (k3s)'
+  - ufw --force enable
+
+  # Install k3s with Traefik Ingress and metrics-server enabled
+  - curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --tls-san 127.0.0.1" sh -
+
+  # Configure user environment for kubeconfig
+  - mkdir -p /root/.kube
+  - cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
+  - chmod 600 /root/.kube/config
