@@ -13,6 +13,7 @@ packages:
   - jq
   - ufw
   - fail2ban
+  - unattended-upgrades
   - ca-certificates
   - open-iscsi
   - nfs-common
@@ -31,12 +32,31 @@ write_files:
       net.bridge.bridge-nf-call-iptables  = 1
       net.bridge.bridge-nf-call-ip6tables = 1
       net.ipv4.ip_forward                 = 1
+      net.ipv4.conf.all.rp_filter         = 1
+      net.ipv4.conf.default.rp_filter     = 1
+      net.ipv4.icmp_echo_ignore_broadcasts = 1
+      net.ipv4.conf.all.accept_source_route = 0
+      net.ipv6.conf.all.accept_source_route = 0
+      net.ipv4.conf.all.send_redirects    = 0
+      net.ipv4.conf.default.send_redirects = 0
+      fs.protected_hardlinks              = 1
+      fs.protected_symlinks               = 1
+
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    permissions: '0644'
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
 
 runcmd:
   # Load kernel modules and apply sysctl settings
   - modprobe overlay
   - modprobe br_netfilter
   - sysctl --system
+
+  # Configure and start fail2ban
+  - systemctl enable fail2ban
+  - systemctl start fail2ban
 
   # Configure UFW firewall
   - ufw default deny incoming

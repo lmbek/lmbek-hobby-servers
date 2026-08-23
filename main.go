@@ -83,11 +83,13 @@ func runCmd(name string, args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	cmd.Env = append(os.Environ(), "KUBECONFIG=/etc/rancher/k3s/k3s.yaml")
 	return cmd.Run()
 }
 
 func runCmdOutput(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
+	cmd.Env = append(os.Environ(), "KUBECONFIG=/etc/rancher/k3s/k3s.yaml")
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
@@ -152,13 +154,26 @@ func setupMaster() error {
 		time.Sleep(2 * time.Second)
 	}
 
-	// Copy kubeconfig to user home if possible
+	// Configure global and user environment for kubeconfig
+	_ = os.WriteFile("/etc/profile.d/k3s.sh", []byte("export KUBECONFIG=/etc/rancher/k3s/k3s.yaml\n"), 0755)
+	if envData, err := os.ReadFile("/etc/environment"); err == nil {
+		if !strings.Contains(string(envData), "KUBECONFIG") {
+			_ = os.WriteFile("/etc/environment", append(envData, []byte("\nKUBECONFIG=/etc/rancher/k3s/k3s.yaml\n")...), 0644)
+		}
+	}
+
 	home, err := os.UserHomeDir()
 	if err == nil {
 		userKube := filepath.Join(home, ".kube")
 		_ = os.MkdirAll(userKube, 0755)
 		if data, err := os.ReadFile("/etc/rancher/k3s/k3s.yaml"); err == nil {
 			_ = os.WriteFile(filepath.Join(userKube, "config"), data, 0600)
+		}
+		bashrcPath := filepath.Join(home, ".bashrc")
+		if bashrcData, err := os.ReadFile(bashrcPath); err == nil {
+			if !strings.Contains(string(bashrcData), "KUBECONFIG") {
+				_ = os.WriteFile(bashrcPath, append(bashrcData, []byte("\nexport KUBECONFIG=/etc/rancher/k3s/k3s.yaml\n")...), 0644)
+			}
 		}
 	}
 
