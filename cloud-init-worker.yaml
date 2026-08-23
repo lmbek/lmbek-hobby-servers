@@ -39,8 +39,47 @@ write_files:
       net.ipv6.conf.all.accept_source_route = 0
       net.ipv4.conf.all.send_redirects    = 0
       net.ipv4.conf.default.send_redirects = 0
+      net.ipv4.conf.all.accept_redirects  = 0
+      net.ipv6.conf.all.accept_redirects  = 0
+      net.ipv4.conf.all.secure_redirects  = 0
+      net.ipv4.conf.default.secure_redirects = 0
+      net.ipv4.conf.all.log_martians      = 1
+      net.ipv4.conf.default.log_martians  = 1
+      net.ipv4.tcp_syncookies             = 1
       fs.protected_hardlinks              = 1
       fs.protected_symlinks               = 1
+      kernel.randomize_va_space           = 2
+      kernel.kptr_restrict                = 2
+      kernel.dmesg_restrict               = 1
+
+  - path: /etc/ssh/sshd_config.d/99-hardened.conf
+    permissions: '0600'
+    content: |
+      # Hardened SSH Configuration
+      PermitRootLogin prohibit-password
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      ChallengeResponseAuthentication no
+      PubkeyAuthentication yes
+      X11Forwarding no
+      AllowAgentForwarding no
+      MaxAuthTries 3
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+      LoginGraceTime 30
+      Protocol 2
+
+  - path: /etc/fail2ban/jail.d/ssh-hardened.local
+    permissions: '0644'
+    content: |
+      [sshd]
+      enabled = true
+      port = 22
+      filter = sshd
+      logpath = /var/log/auth.log
+      maxretry = 3
+      findtime = 600
+      bantime = 3600
 
   - path: /etc/apt/apt.conf.d/20auto-upgrades
     permissions: '0644'
@@ -54,9 +93,10 @@ runcmd:
   - modprobe br_netfilter
   - sysctl --system
 
-  # Configure and start fail2ban
+  # Configure and start fail2ban & reload hardened SSH
   - systemctl enable fail2ban
-  - systemctl start fail2ban
+  - systemctl restart fail2ban
+  - systemctl reload ssh || systemctl restart ssh
 
   # Configure UFW firewall
   - ufw default deny incoming
