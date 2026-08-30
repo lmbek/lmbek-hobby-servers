@@ -18,6 +18,9 @@ Nodes communicate securely over the isolated Hetzner Cloud private network (`10.
 When provisioned via Terraform (`infrastructure/iac`), cloud-init runs automatically:
 - `cloud-init-master.yaml` initializes the K3s control plane and binds to `10.0.1.10`.
 - `cloud-init-worker.yaml` waits for the master API to become ready and connects as a worker agent.
+- The master installs pinned cert-manager and Argo CD manifests, configures the issuers, and registers both platform applications.
+
+Set `lmbek.dk`, `*.lmbek.dk`, and `*.staging.lmbek.dk` DNS `A` records to Terraform's `ingress_target_ip`. DNS must resolve before Let's Encrypt HTTP-01 certificates can become ready.
 
 ---
 
