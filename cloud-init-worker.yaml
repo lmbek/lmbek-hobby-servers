@@ -32,8 +32,9 @@ write_files:
       net.bridge.bridge-nf-call-iptables  = 1
       net.bridge.bridge-nf-call-ip6tables = 1
       net.ipv4.ip_forward                 = 1
-      net.ipv4.conf.all.rp_filter         = 1
-      net.ipv4.conf.default.rp_filter     = 1
+      # Loose reverse-path filtering is required for multi-interface overlay networking.
+      net.ipv4.conf.all.rp_filter         = 2
+      net.ipv4.conf.default.rp_filter     = 2
       net.ipv4.icmp_echo_ignore_broadcasts = 1
       net.ipv4.conf.all.accept_source_route = 0
       net.ipv6.conf.all.accept_source_route = 0
@@ -98,21 +99,50 @@ runcmd:
   - systemctl restart fail2ban
   - systemctl reload ssh || systemctl restart ssh
 
-  # Configure UFW firewall
-  - ufw default deny incoming
-  - ufw default allow outgoing
-  - ufw allow 22/tcp comment 'SSH'
-  - ufw allow in on eth1 comment 'Hetzner Private Network'
-  - ufw --force enable
-
-  # Wait for Master K3s API to become healthy on private network before joining
-  - >
-    bash -c '
-    echo "Waiting for Master API endpoint at https://${master_private_ip}:6443/ping..."
-    until curl -k -s -f https://${master_private_ip}:6443/ping; do
-      echo "Master API not ready yet. Retrying in 5 seconds..."
+  # Wait for Terraform to attach the private NIC and discover its actual OS name.
+  - |
+    set -eu
+    private_iface=""
+    for attempt in $(seq 1 120); do
+      private_iface=$(ip -o -4 addr show | awk -v ip="${worker_private_ip}" '$4 ~ ("^" ip "/") { print $2; exit }')
+      if [ -n "$private_iface" ]; then
+        break
+      fi
       sleep 5
     done
-    echo "Master API is ready! Joining cluster as worker node..."
-    curl -sfL https://get.k3s.io | K3S_URL=https://${master_private_ip}:6443 K3S_TOKEN=${cluster_token} INSTALL_K3S_EXEC="agent --node-ip ${worker_private_ip} --flannel-iface eth1" sh -
-    '
+    if [ -z "$private_iface" ]; then
+      echo "Private address ${worker_private_ip} was not attached within 10 minutes" >&2
+      exit 1
+    fi
+    printf '%s' "$private_iface" > /run/k3s-private-interface
+
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw default allow routed
+    ufw allow 22/tcp comment 'SSH'
+    ufw allow 80/tcp comment 'HTTP (Traefik ServiceLB)'
+    ufw allow 443/tcp comment 'HTTPS (Traefik ServiceLB)'
+    ufw allow in on "$private_iface" comment 'Hetzner private network'
+    ufw route allow in on "$private_iface" comment 'K3s private forwarding'
+    ufw allow from 10.42.0.0/16 comment 'K3s pod network'
+    ufw allow from 10.43.0.0/16 comment 'K3s service network'
+    ufw --force enable
+
+  # Wait for Master K3s API to become healthy on private network before joining
+  - |
+    set -eu
+    echo "Waiting for Master API endpoint at https://${master_private_ip}:6443/ping..."
+    ready=""
+    for attempt in $(seq 1 120); do
+      if curl -kfsS --connect-timeout 3 https://${master_private_ip}:6443/ping >/dev/null; then
+        ready=true
+        break
+      fi
+      sleep 5
+    done
+    if [ -z "$ready" ]; then
+      echo "Master API did not become ready within 10 minutes" >&2
+      exit 1
+    fi
+    private_iface=$(cat /run/k3s-private-interface)
+    curl -sfL https://get.k3s.io | K3S_URL=https://${master_private_ip}:6443 K3S_TOKEN=${cluster_token} INSTALL_K3S_EXEC="agent --node-ip ${worker_private_ip} --flannel-iface $private_iface" sh -

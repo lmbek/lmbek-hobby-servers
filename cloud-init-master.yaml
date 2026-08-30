@@ -32,8 +32,9 @@ write_files:
       net.bridge.bridge-nf-call-iptables  = 1
       net.bridge.bridge-nf-call-ip6tables = 1
       net.ipv4.ip_forward                 = 1
-      net.ipv4.conf.all.rp_filter         = 1
-      net.ipv4.conf.default.rp_filter     = 1
+      # Loose reverse-path filtering is required for multi-interface overlay networking.
+      net.ipv4.conf.all.rp_filter         = 2
+      net.ipv4.conf.default.rp_filter     = 2
       net.ipv4.icmp_echo_ignore_broadcasts = 1
       net.ipv4.conf.all.accept_source_route = 0
       net.ipv6.conf.all.accept_source_route = 0
@@ -92,6 +93,39 @@ write_files:
     content: |
       export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
+  - path: /etc/rancher/k3s/cluster-issuers.yaml
+    permissions: '0600'
+    content: |
+      apiVersion: cert-manager.io/v1
+      kind: ClusterIssuer
+      metadata:
+        name: letsencrypt-staging
+      spec:
+        acme:
+          server: https://acme-staging-v02.api.letsencrypt.org/directory
+          email: ${acme_email}
+          privateKeySecretRef:
+            name: letsencrypt-staging-account-key
+          solvers:
+            - http01:
+                ingress:
+                  ingressClassName: traefik
+      ---
+      apiVersion: cert-manager.io/v1
+      kind: ClusterIssuer
+      metadata:
+        name: letsencrypt-prod
+      spec:
+        acme:
+          server: https://acme-v02.api.letsencrypt.org/directory
+          email: ${acme_email}
+          privateKeySecretRef:
+            name: letsencrypt-prod-account-key
+          solvers:
+            - http01:
+                ingress:
+                  ingressClassName: traefik
+
 runcmd:
   # Load kernel modules and apply sysctl settings
   - modprobe overlay
@@ -103,26 +137,41 @@ runcmd:
   - systemctl restart fail2ban
   - systemctl reload ssh || systemctl restart ssh
 
-  # Configure UFW firewall
-  - ufw default deny incoming
-  - ufw default allow outgoing
-  - ufw allow 22/tcp comment 'SSH'
-  - ufw allow 80/tcp comment 'HTTP (Traefik Ingress)'
-  - ufw allow 443/tcp comment 'HTTPS (Traefik Ingress)'
-  - ufw allow in on eth1 comment 'Hetzner Private Network (Internal K3s API 6443 & Flannel)'
-  - ufw --force enable
+  # Terraform attaches the private NIC after creating the server. Wait for it and
+  # discover its predictable purpose by address rather than assuming an OS device name.
+  - |
+    set -eu
+    private_iface=""
+    for attempt in $(seq 1 120); do
+      private_iface=$(ip -o -4 addr show | awk -v ip="${master_private_ip}" '$4 ~ ("^" ip "/") { print $2; exit }')
+      if [ -n "$private_iface" ]; then
+        break
+      fi
+      sleep 5
+    done
+    if [ -z "$private_iface" ]; then
+      echo "Private address ${master_private_ip} was not attached within 10 minutes" >&2
+      exit 1
+    fi
+    printf '%s' "$private_iface" > /run/k3s-private-interface
+
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw default allow routed
+    ufw allow 22/tcp comment 'SSH'
+    ufw allow 80/tcp comment 'HTTP (Traefik Ingress)'
+    ufw allow 443/tcp comment 'HTTPS (Traefik Ingress)'
+    ufw allow in on "$private_iface" comment 'Hetzner private network'
+    ufw route allow in on "$private_iface" comment 'K3s private forwarding'
+    ufw allow from 10.42.0.0/16 comment 'K3s pod network'
+    ufw allow from 10.43.0.0/16 comment 'K3s service network'
+    ufw --force enable
 
   # Install K3s control plane server bound to private network with secrets encryption
-  - >
-    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server
-    --token ${cluster_token}
-    --node-ip ${master_private_ip}
-    --advertise-address ${master_private_ip}
-    --flannel-iface eth1
-    --write-kubeconfig-mode 644
-    --secrets-encryption
-    --tls-san ${master_private_ip}
-    --tls-san 127.0.0.1" sh -
+  - |
+    set -eu
+    private_iface=$(cat /run/k3s-private-interface)
+    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --token ${cluster_token} --node-ip ${master_private_ip} --advertise-address ${master_private_ip} --flannel-iface $private_iface --write-kubeconfig-mode 600 --secrets-encryption --tls-san ${master_private_ip} --tls-san 127.0.0.1" sh -
 
   # Wait for K3s to initialize and setup kubeconfig environment
   - >
@@ -141,3 +190,19 @@ runcmd:
     echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> /etc/environment
     echo "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> /root/.bashrc
     '
+
+  # Bootstrap the GitOps control plane with pinned component versions.
+  - |
+    set -eu
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+    kubectl wait --for=condition=Ready node --all --timeout=180s
+    curl --retry 5 --retry-all-errors -fsSL https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml | kubectl apply -f -
+    kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=180s
+    kubectl apply -f /etc/rancher/k3s/cluster-issuers.yaml
+
+    kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+    curl --retry 5 --retry-all-errors -fsSL https://raw.githubusercontent.com/argoproj/argo-cd/v2.14.11/manifests/install.yaml | kubectl apply -n argocd -f -
+    kubectl wait --for=condition=Available deployment/argocd-server -n argocd --timeout=300s
+    curl --retry 5 --retry-all-errors -fsSL https://raw.githubusercontent.com/lmbek/lmbek-hobby-platform/main/argocd/staging.yml | kubectl apply -f -
+    curl --retry 5 --retry-all-errors -fsSL https://raw.githubusercontent.com/lmbek/lmbek-hobby-platform/main/argocd/production.yml | kubectl apply -f -
