@@ -1,61 +1,49 @@
 #cloud-config
-# ─────────────────────────────────────────────────────────────────────────────
-# Cloud-init configuration for lightweight k3s Single-Node Kubernetes Platform
-# Target OS: Ubuntu 22.04 LTS / 24.04 LTS or Debian 12
-# ─────────────────────────────────────────────────────────────────────────────
-
-package_update: true
-package_upgrade: true
-
-packages:
-  - curl
-  - wget
-  - git
-  - jq
-  - ufw
-  - fail2ban
-  - ca-certificates
-  - gnupg
-  - lsb-release
-  - open-iscsi
-  - nfs-common
-  - iptables
-
 write_files:
-  # Enable required kernel modules for k3s networking
-  - path: /etc/modules-load.d/k3s.conf
-    permissions: '0644'
+  - path: /etc/ssh/sshd_config.d/99-hardened.conf
+    permissions: '0600'
     content: |
-      overlay
-      br_netfilter
-
-  # Kernel sysctl parameters required for Kubernetes bridge networking & forwarding
-  - path: /etc/sysctl.d/99-kubernetes-k3s.conf
-    permissions: '0644'
-    content: |
-      net.bridge.bridge-nf-call-iptables  = 1
-      net.bridge.bridge-nf-call-ip6tables = 1
-      net.ipv4.ip_forward                 = 1
+      PermitRootLogin prohibit-password
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      X11Forwarding no
+      AllowAgentForwarding no
+      MaxAuthTries 3
 
 runcmd:
-  # Load kernel modules and apply sysctl settings
-  - modprobe overlay
-  - modprobe br_netfilter
-  - sysctl --system
+  - systemctl restart ssh
+  - |
+    set -eu
 
-  # Configure UFW firewall
-  - ufw default deny incoming
-  - ufw default allow outgoing
-  - ufw allow 22/tcp comment 'SSH'
-  - ufw allow 80/tcp comment 'HTTP (Traefik Ingress)'
-  - ufw allow 443/tcp comment 'HTTPS (Traefik Ingress)'
-  - ufw allow 6443/tcp comment 'Kubernetes API (k3s)'
-  - ufw --force enable
+    if ! command -v curl >/dev/null 2>&1; then
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y ca-certificates curl
+    fi
 
-  # Install k3s with Traefik Ingress and metrics-server enabled
-  - curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --tls-san 127.0.0.1" sh -
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="v1.32.3+k3s1" INSTALL_K3S_EXEC="server --write-kubeconfig-mode 600 --secrets-encryption" sh -
 
-  # Configure user environment for kubeconfig
-  - mkdir -p /root/.kube
-  - cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
-  - chmod 600 /root/.kube/config
+    export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+    kubectl wait --for=condition=Ready node --all --timeout=180s
+
+    bootstrap_dir=$(mktemp -d)
+    trap 'rm -rf "$bootstrap_dir"' EXIT
+    curl --retry 5 --retry-all-errors -fsSL -o "$bootstrap_dir/cert-manager.yaml" https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml &
+    cert_manager_download_pid=$!
+    curl --retry 5 --retry-all-errors -fsSL -o "$bootstrap_dir/argocd.yaml" https://raw.githubusercontent.com/argoproj/argo-cd/v2.14.11/manifests/install.yaml &
+    argocd_download_pid=$!
+    wait "$cert_manager_download_pid"
+    wait "$argocd_download_pid"
+
+    kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f -
+    kubectl apply -f "$bootstrap_dir/cert-manager.yaml" &
+    cert_manager_apply_pid=$!
+    kubectl apply -n argocd -f "$bootstrap_dir/argocd.yaml" &
+    argocd_apply_pid=$!
+    wait "$cert_manager_apply_pid"
+    wait "$argocd_apply_pid"
+
+    kubectl wait --for=condition=Established crd/clusterissuers.cert-manager.io --timeout=180s
+    kubectl wait --for=condition=Established crd/applications.argoproj.io --timeout=180s
+
+    kubectl apply -f https://raw.githubusercontent.com/lmbek/lmbek-hobby-platform/main/argocd/production.yml
+    kubectl apply -f https://raw.githubusercontent.com/lmbek/lmbek-hobby-platform/main/argocd/staging.yml
